@@ -1,0 +1,49 @@
+[package]
+name = "snap-ocr"
+version = "0.1.0"
+edition = "2021"
+authors = ["SnapOCR Contributors"]
+description = "A lightweight, fast, cross-platform OCR engine for desktop screenshot text recognition. Supports Chinese-English mixed text with sub-100ms latency on CPU."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/snap-ocr"
+keywords = ["ocr", "text-recognition", "dbnet", "crnn", "ctc"]
+categories = ["computer-vision", "text-processing"]
+
+[lib]
+name = "snap_ocr"
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+# ONNX Runtime inference engine with dynamic loading & DirectML GPU acceleration
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic", "directml", "ndarray", "std"] }
+
+# Pure Rust image processing (no libpng/opencv)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Efficient N-dimensional array operations
+ndarray = "0.17"
+
+# Serialization for OcrResult output
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+log = "0.4"
+
+[dev-dependencies]
+# Benchmarking framework
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "benchmark"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+debug = true
