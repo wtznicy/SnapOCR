@@ -82,7 +82,7 @@ impl Default for OcrEngineConfig {
         Self {
             model_dir: PathBuf::from("models"),
             num_threads: 4,
-            max_side_len: 960,
+            max_side_len: 768,
             score_thresh: 0.3,
             box_expand_ratio: 2.1,
             min_area: 3.0,

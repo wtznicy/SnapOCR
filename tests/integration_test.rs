@@ -241,7 +241,7 @@ fn test_ocr_result_serialize() {
 fn test_user_mixed_image() {
     let config = OcrEngineConfig {
         model_dir: "models/".into(),
-        enable_hw_accel: true,
+        enable_hw_accel: false,
         ..Default::default()
     };
     let engine = SnapOcrEngine::new(config).expect("Engine init failed");
@@ -249,6 +249,10 @@ fn test_user_mixed_image() {
     let img_path = r"C:\Users\HUAWEI\.gemini\antigravity\brain\95594fd9-2ec8-41f7-99a1-50e9d2718017\.user_uploaded\media_1789458488059.png";
     if std::path::Path::new(img_path).exists() {
         let bytes = std::fs::read(img_path).expect("Read image");
+        println!("Rayon threads: {}", rayon::current_num_threads());
+        // Run 1 (cold)
+        let _ = engine.recognize_encoded_image(&bytes);
+        // Run 2 (warm)
         let res = engine.recognize_encoded_image(&bytes).expect("OCR failed");
         println!("\n=== SNAP-OCR RESULT ({} lines, total: {:.1}ms) ===", res.lines.len(), res.latency_ms.total_ms);
         println!("Det: {:.1}ms, Rec: {:.1}ms", res.latency_ms.detect_ms, res.latency_ms.recognize_ms);

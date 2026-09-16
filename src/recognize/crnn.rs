@@ -2,17 +2,73 @@
 //!
 //! Runs the recognition ONNX model on cropped text line images
 //! and decodes the output using CTC greedy decoding.
+//! Supports multi-threaded parallel inference via Rayon and SessionPool.
 
 use crate::config::OcrEngineConfig;
 use crate::error::OcrError;
-use crate::preprocess::preprocess_for_recognition;
 use crate::recognize::ctc_decode::{ctc_greedy_decode, indices_to_string};
 
 use image::RgbImage;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
-use std::sync::Mutex;
+use rayon::prelude::*;
+use std::sync::{Condvar, Mutex};
+
+/// A thread-safe pool of ONNX Runtime Sessions for parallel recognition.
+struct SessionPool {
+    sessions: Mutex<Vec<Session>>,
+    cvar: Condvar,
+}
+
+impl SessionPool {
+    fn new(sessions: Vec<Session>) -> Self {
+        Self {
+            sessions: Mutex::new(sessions),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> PooledSession<'_> {
+        let mut lock = self.sessions.lock().unwrap();
+        while lock.is_empty() {
+            lock = self.cvar.wait(lock).unwrap();
+        }
+        let session = lock.pop().unwrap();
+        PooledSession {
+            pool: self,
+            session: Some(session),
+        }
+    }
+}
+
+struct PooledSession<'a> {
+    pool: &'a SessionPool,
+    session: Option<Session>,
+}
+
+impl<'a> std::ops::Deref for PooledSession<'a> {
+    type Target = Session;
+    fn deref(&self) -> &Self::Target {
+        self.session.as_ref().unwrap()
+    }
+}
+
+impl<'a> std::ops::DerefMut for PooledSession<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.session.as_mut().unwrap()
+    }
+}
+
+impl<'a> Drop for PooledSession<'a> {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            let mut lock = self.pool.sessions.lock().unwrap();
+            lock.push(session);
+            self.pool.cvar.notify_one();
+        }
+    }
+}
 
 /// Result of recognizing a single text line.
 #[derive(Debug, Clone)]
@@ -23,10 +79,10 @@ pub(crate) struct RecognizedLine {
     pub confidence: f32,
 }
 
-/// CRNN text recognizer wrapping an ONNX Runtime session.
+/// CRNN text recognizer wrapping an ONNX Runtime session pool.
 #[allow(dead_code)]
 pub(crate) struct CrnnRecognizer {
-    session: Mutex<Session>,
+    pool: SessionPool,
     vocab: Vec<char>,
     rec_image_height: u32,
     batch_size: usize,
@@ -57,64 +113,60 @@ impl CrnnRecognizer {
         }
         log::info!("Loaded recognition vocabulary: {} tokens", vocab.len());
 
-        // Note: For CRNN with dynamic sequence lengths, CPU inference is optimal
-        // because DirectML recompiles HLSL shaders for every unique line width.
-        let session = Session::builder()
-            .map_err(|e| OcrError::ModelLoad { model_name: "rec.onnx".to_string(), reason: e.to_string() })?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| OcrError::ModelLoad { model_name: "rec.onnx".to_string(), reason: e.to_string() })?
-            .with_intra_threads(config.num_threads)
-            .map_err(|e| OcrError::ModelLoad { model_name: "rec.onnx".to_string(), reason: e.to_string() })?
-            .commit_from_file(&model_path)
-            .map_err(|e| OcrError::ModelLoad {
-                model_name: "rec.onnx".to_string(),
-                reason: e.to_string(),
-            })?;
+        // Configure SessionPool:
+        // 4 concurrent worker sessions balances CPU throughput, L2/L3 cache locality, and RAM
+        let pool_size = 4;
+
+        let mut sessions = Vec::with_capacity(pool_size);
+        for i in 0..pool_size {
+            let session = Session::builder()
+                .map_err(|e| OcrError::ModelLoad { model_name: format!("rec.onnx #{}", i), reason: e.to_string() })?
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .map_err(|e| OcrError::ModelLoad { model_name: format!("rec.onnx #{}", i), reason: e.to_string() })?
+                .with_intra_threads(1)
+                .map_err(|e| OcrError::ModelLoad { model_name: format!("rec.onnx #{}", i), reason: e.to_string() })?
+                .commit_from_file(&model_path)
+                .map_err(|e| OcrError::ModelLoad {
+                    model_name: "rec.onnx".to_string(),
+                    reason: e.to_string(),
+                })?;
+            sessions.push(session);
+        }
+        log::info!("Initialized CRNN recognizer session pool with {} instances", sessions.len());
 
         Ok(Self {
-            session: Mutex::new(session),
+            pool: SessionPool::new(sessions),
             vocab,
             rec_image_height: config.rec_image_height,
             batch_size: config.rec_batch_size,
         })
     }
 
-    /// Recognize text from a list of cropped text line images.
+    /// Recognize text from a list of cropped text line images in parallel using Rayon.
     pub fn recognize_lines(
         &self,
         line_images: &[RgbImage],
     ) -> Result<Vec<RecognizedLine>, OcrError> {
-        let mut results = Vec::with_capacity(line_images.len());
-
-        for img in line_images {
-            let result = self.recognize_single(img)?;
-            results.push(result);
+        if line_images.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(results)
+        line_images
+            .par_iter()
+            .map(|img| self.recognize_single(img))
+            .collect()
     }
 
     /// Recognize text from a single cropped text line image.
     fn recognize_single(&self, img: &RgbImage) -> Result<RecognizedLine, OcrError> {
-        let input_tensor = preprocess_for_recognition(img, self.rec_image_height);
-        let (_, c, h, w) = (
-            input_tensor.shape()[0],
-            input_tensor.shape()[1],
-            input_tensor.shape()[2],
-            input_tensor.shape()[3],
-        );
-
-        let tensor_data: Vec<f32> = input_tensor.iter().copied().collect();
-        let rec_tensor = Tensor::from_array(([1, c, h, w], tensor_data))
+        let (w, h, data) = crate::preprocess::preprocess_for_recognition_vec(img, self.rec_image_height);
+        let rec_tensor = Tensor::from_array(([1, 3, h as usize, w as usize], data))
             .map_err(|e| OcrError::InferenceError {
                 stage: "recognition".to_string(),
                 reason: format!("Failed to create tensor: {}", e),
             })?;
 
-        let mut session = self.session.lock().map_err(|e| OcrError::InferenceError {
-            stage: "recognition".to_string(),
-            reason: format!("Session lock poisoned: {}", e),
-        })?;
+        let mut session = self.pool.acquire();
 
         let output = session
             .run(ort::inputs![rec_tensor])
@@ -161,12 +213,10 @@ impl CrnnRecognizer {
 
 #[cfg(test)]
 mod tests {
-
     #[test]
     fn test_vocab_construction() {
-        // Simulate a small vocabulary file
         let vocab_text = "a\nb\nc\n你\n好\n";
-        let mut vocab: Vec<char> = vec![' ']; // blank
+        let mut vocab: Vec<char> = vec![' '];
         for line in vocab_text.lines() {
             let line = line.trim();
             if !line.is_empty() {
@@ -175,7 +225,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(vocab.len(), 6); // blank + 5 chars
+        assert_eq!(vocab.len(), 6);
         assert_eq!(vocab[0], ' ');
         assert_eq!(vocab[1], 'a');
         assert_eq!(vocab[5], '好');

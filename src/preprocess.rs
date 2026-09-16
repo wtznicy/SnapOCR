@@ -105,6 +105,7 @@ pub(crate) fn preprocess_for_detection(
 /// 1. Resize height to `target_height` if needed, width proportionally
 /// 2. Normalize RGB channels to `[-1.0, 1.0]` range: `(pixel / 255.0 - 0.5) / 0.5`
 /// 3. Return as `[1, 3, H, W]` f32 tensor
+#[allow(dead_code)]
 pub(crate) fn preprocess_for_recognition(
     img: &RgbImage,
     target_height: u32,
@@ -135,6 +136,48 @@ pub(crate) fn preprocess_for_recognition(
     }
 
     tensor
+}
+
+/// Fast single-pass preprocessing returning flat contiguous f32 NCHW vector directly.
+pub(crate) fn preprocess_for_recognition_vec(
+    img: &RgbImage,
+    target_height: u32,
+) -> (u32, u32, Vec<f32>) {
+    let (w, h) = (img.width(), img.height());
+
+    let (target_width, resized) = if h == target_height {
+        (w, None)
+    } else {
+        let aspect = w as f32 / h.max(1) as f32;
+        let tw = ((target_height as f32 * aspect).round() as u32).max(1);
+        let r = image::imageops::resize(img, tw, target_height, FilterType::Triangle);
+        (tw, Some(r))
+    };
+
+    let th = target_height as usize;
+    let tw = target_width as usize;
+    let plane_size = th * tw;
+    let mut data = vec![0.0f32; 3 * plane_size];
+
+    let source = resized.as_ref().unwrap_or(img);
+    let raw_bytes = source.as_raw();
+
+    for y in 0..th {
+        let row_offset = y * tw;
+        for x in 0..tw {
+            let px_idx = (row_offset + x) * 3;
+            let r = raw_bytes[px_idx];
+            let g = raw_bytes[px_idx + 1];
+            let b = raw_bytes[px_idx + 2];
+
+            let dst_idx = row_offset + x;
+            data[dst_idx] = (r as f32 / 255.0 - 0.5) / 0.5;
+            data[plane_size + dst_idx] = (g as f32 / 255.0 - 0.5) / 0.5;
+            data[2 * plane_size + dst_idx] = (b as f32 / 255.0 - 0.5) / 0.5;
+        }
+    }
+
+    (target_width, target_height, data)
 }
 
 /// Pad a recognition tensor to a target width (for batching lines of different widths).
