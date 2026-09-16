@@ -14,8 +14,68 @@ pub(crate) fn clean_text(text: &str) -> String {
     let text = normalize_symbols(text);
     let text = fix_cjk_latin_spacing(&text);
     let text = fix_common_ocr_flaws(&text);
+    let text = fix_chinese_quotes(&text);
     let text = collapse_whitespace(&text);
     text.trim().to_string()
+}
+
+/// Fix quotation marks in Chinese text into proper pairs “ ... ”.
+///
+/// In Chinese context, OCR frequently misclassifies opening quote “ as closing quote ”
+/// or straight quote ". This function ensures quotes are properly paired.
+fn fix_chinese_quotes(text: &str) -> String {
+    let has_cjk = text.chars().any(is_cjk);
+    if !has_cjk {
+        return text.to_string();
+    }
+
+    // Step 1: Deduplicate consecutive quote marks (e.g. ”” or ““ or “””)
+    let mut deduped = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '"' || ch == '“' || ch == '”' {
+            let mut last_q = ch;
+            while i + 1 < chars.len() && (chars[i + 1] == '"' || chars[i + 1] == '“' || chars[i + 1] == '”') {
+                if chars[i + 1] == '”' {
+                    last_q = '”';
+                }
+                i += 1;
+            }
+            deduped.push(last_q);
+        } else {
+            deduped.push(ch);
+        }
+        i += 1;
+    }
+
+    // Step 2: Pair and balance quotes
+    let mut result = Vec::with_capacity(deduped.len());
+    let mut in_quote = false;
+
+    for i in 0..deduped.len() {
+        let ch = deduped[i];
+        if ch == '"' || ch == '“' || ch == '”' {
+            let next_ch = if i + 1 < deduped.len() { Some(deduped[i + 1]) } else { None };
+            let is_closing_env = matches!(next_ch, Some('，' | '。' | '！' | '？' | '；' | '：' | '、' | ' ' | '\n') | None);
+
+            if is_closing_env && in_quote {
+                result.push('”');
+                in_quote = false;
+            } else if !in_quote {
+                result.push('“');
+                in_quote = true;
+            } else {
+                result.push('”');
+                in_quote = false;
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result.into_iter().collect()
 }
 
 fn fix_common_ocr_flaws(text: &str) -> String {
@@ -347,5 +407,17 @@ mod tests {
     #[test]
     fn test_collapse_leading_trailing() {
         assert_eq!(clean_text("  hello world  "), "hello world");
+    }
+
+    #[test]
+    fn test_fix_chinese_quotes() {
+        assert_eq!(clean_text("开设了一个”排忧解难”专栏"), "开设了一个“排忧解难”专栏");
+        assert_eq!(clean_text("开设了一个\"排忧解难\"专栏"), "开设了一个“排忧解难”专栏");
+        assert_eq!(clean_text("开设了一个“排忧解难”专栏"), "开设了一个“排忧解难”专栏");
+        assert_eq!(clean_text("开设了一个“排忧解难”””专栏，"), "开设了一个“排忧解难”专栏，");
+        assert_eq!(clean_text("开设了一个“排忧解难””专栏"), "开设了一个“排忧解难”专栏");
+        assert_eq!(clean_text("开设了一个 “排忧解难” 专栏，"), "开设了一个 “排忧解难” 专栏，");
+        assert_eq!(clean_text("他说：“你好，世界！”"), "他说：“你好，世界！”");
+        assert_eq!(clean_text("He said, \"Hello world.\""), "He said, \"Hello world.\"");
     }
 }
